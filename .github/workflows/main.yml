@@ -1,0 +1,55 @@
+# Awwurl batch probe for GitHub Actions.
+# Put this file at .github/workflows/probe.yml in a PUBLIC repository (unlimited minutes).
+# Repository → Settings → Secrets and variables → Actions:
+#   AW_SITE  = https://awwurl.com
+#   AW_TOKEN = <API token from WP admin → Awwurl>
+# Runs hourly, checks up to 5,000 hosts from the site's target list with curl, and posts results back.
+# Region label "US" (GitHub hosted runners are in the US).
+
+name: awwurl probe
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch targets
+        run: |
+          curl -sS -H "Authorization: Bearer ${{ secrets.AW_TOKEN }}" "${{ secrets.AW_SITE }}/wp-json/aw/v1/targets?limit=5000&offset=$(( ( $(date +%H) % 4 ) * 5000 ))" > targets.json
+          jq -r '.hosts[]' targets.json > hosts.txt
+          wc -l hosts.txt
+      - name: Check hosts
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 AwwurlBot/1.0"
+          export UA
+          check() {
+            host="$1"
+            out=$(curl -sS -o /dev/null -L --max-redirs 5 --max-time 10 -A "$UA" -w '%{http_code} %{time_total} %{exitcode}' "https://$host/" 2>/dev/null || echo "000 0 7")
+            set -- $out
+            code=$1; ms=$(awk -v t="$2" 'BEGIN{printf "%d", t*1000}'); rc=$3
+            for alt in "https://www.$host/" "http://$host/"; do
+              if [ "$code" = "000" ]; then
+                out=$(curl -sS -o /dev/null -L --max-redirs 5 --max-time 10 -A "$UA" -w '%{http_code} %{time_total} %{exitcode}' "$alt" 2>/dev/null || echo "000 0 7")
+                set -- $out; code=$1; ms=$(awk -v t="$2" 'BEGIN{printf "%d", t*1000}'); rc=$3
+              fi
+            done
+            # Any answer below 500 is reachable; 403 bot walls and 404 root pages are not outages.
+            if [ "$code" -ge 100 ] 2>/dev/null && [ "$code" -lt 500 ]; then ok=1; err=null; else ok=0; err="\"curl exit $rc, HTTP $code\""; fi
+            echo "{\"host\":\"$host\",\"ok\":$ok,\"code\":$code,\"ms\":$ms,\"error\":$err}"
+          }
+          export -f check
+          xargs -a hosts.txt -P 40 -I{} bash -c 'check "$@"' _ {} > results.jsonl
+          jq -s '{source:"gh",region:"US",results:.}' results.jsonl > payload.json
+          jq '.results | length' payload.json
+      - name: Post results
+        run: |
+          # Split into chunks of 1,000 so no single request is too large for shared hosting.
+          jq -c '.results | _nwise(1000)' payload.json | while read -r chunk; do
+            echo "{\"source\":\"gh\",\"region\":\"US\",\"results\":$chunk}" > chunk.json
+            curl -sS -X POST -H "Authorization: Bearer ${{ secrets.AW_TOKEN }}" -H "Content-Type: application/json" --data @chunk.json "${{ secrets.AW_SITE }}/wp-json/aw/v1/ingest"
+            echo
+          done
